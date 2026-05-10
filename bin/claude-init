@@ -1,0 +1,1410 @@
+#!/usr/bin/env bash
+# claude-init — opinionated, idempotent Claude Code project initializer
+# v1.3.0
+#
+# Polyglot stack detection. Best-practice hooks, sub-agents, slash commands,
+# and project memory. Safe to run on new OR partially-initialized projects.
+#
+# Usage:
+#   claude-init [options]
+#
+# Common options:
+#   --force          Overwrite differing files (backs them up to *.bak.<timestamp>)
+#   --dry-run        Show what would happen, write nothing
+#   --quiet          Suppress informational output
+#   --configure      Interactive setup of global model defaults
+#   --show-config    Print the resolved configuration and exit
+#   -h, --help       This message
+#
+# Sub-agent model configuration (per-run overrides):
+#   --planner=MODEL          Model for the planner sub-agent (opus/sonnet/haiku)
+#   --reviewer=MODEL         Model for the code-reviewer sub-agent
+#   --test-runner=MODEL      Model for the test-runner sub-agent
+#   --debugger=MODEL         Model for the debugger sub-agent
+#   --preset=NAME            Apply a preset (overrides defaults; per-agent flags win)
+#
+# Available presets:
+#   opus-heavy     — all four sub-agents on Opus (max quality, max quota burn)
+#   balanced       — planner/reviewer/debugger on Opus, test-runner on Sonnet (default)
+#   thrifty        — only planner on Opus, the rest on Sonnet
+#   minimal        — all four on Sonnet
+#   haiku-runner   — planner/reviewer/debugger on Opus, test-runner on Haiku
+#
+# Configuration priority (highest wins):
+#   1. CLI flags (--planner=opus, --preset=balanced, etc.)
+#   2. Environment variables (CLAUDE_INIT_PLANNER_MODEL, etc.)
+#   3. Config file (~/.config/claude-init/config — set via --configure)
+#   4. Built-in defaults (the 'balanced' preset)
+#
+# What it creates (only if missing, unless --force):
+#   CLAUDE.md                       — project memory (under 200 lines)
+#   .claude/settings.json           — hooks config
+#   .claude/hooks/format.sh         — polyglot post-edit formatter
+#   .claude/hooks/danger-guard.sh   — pre-bash safety net
+#   .claude/hooks/test-on-stop.sh   — block stop until tests pass
+#   .claude/agents/planner.md       — plan-before-code (model: configurable)
+#   .claude/agents/code-reviewer.md — read-only review (model: configurable)
+#   .claude/agents/test-runner.md   — fast test execution (model: configurable)
+#   .claude/agents/debugger.md      — reproduce-isolate-fix (model: configurable)
+#   .claude/commands/plan.md        — /plan slash command
+#   .claude/commands/review.md      — /review slash command
+#   .claude/commands/ship.md        — /ship slash command
+#   .claude/MCP_SETUP.md            — comprehensive MCP server reference
+#   .gitignore                      — adds Claude-related entries
+
+set -euo pipefail
+
+VERSION="1.3.0"
+FORCE=0
+DRY_RUN=0
+VERBOSE=1
+TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
+CONFIGURE=0
+SHOW_CONFIG=0
+
+# ---------- model defaults (the 'balanced' preset) ----------
+MODEL_PLANNER="opus"
+MODEL_REVIEWER="opus"
+MODEL_TESTRUNNER="sonnet"
+MODEL_DEBUGGER="opus"
+
+# ---------- color / logging (declared early so config code can use them) ----------
+if [[ -t 2 ]]; then
+  R=$'\033[0m'; B=$'\033[1m'; D=$'\033[2m'
+  GR=$'\033[32m'; YL=$'\033[33m'; BL=$'\033[34m'; RD=$'\033[31m'
+else
+  R=""; B=""; D=""; GR=""; YL=""; BL=""; RD=""
+fi
+log()  { [[ $VERBOSE -eq 1 ]] && printf "%s\n" "$*" >&2 || true; }
+make_() { log "${GR}+${R}  $*"; }
+keep() { log "${D}=  $*${R}"; }
+back() { log "${YL}~${R}  $*"; }
+plan_() { log "${BL}?${R}  $*"; }
+warn() { log "${YL}⚠${R}  $*"; }
+err()  { log "${RD}✗${R}  $*"; }
+
+# ---------- model helpers ----------
+validate_model() {
+  case "$1" in
+    opus|sonnet|haiku) return 0 ;;
+    *) printf "✗ Invalid model '%s' — must be opus, sonnet, or haiku.\n" "$1" >&2
+       exit 1 ;;
+  esac
+}
+cap_model() {
+  case "$1" in
+    opus) echo "Opus" ;; sonnet) echo "Sonnet" ;; haiku) echo "Haiku" ;;
+    *) echo "$1" ;;
+  esac
+}
+apply_preset() {
+  case "$1" in
+    opus-heavy|opus_heavy)
+      MODEL_PLANNER="opus";  MODEL_REVIEWER="opus"
+      MODEL_TESTRUNNER="opus"; MODEL_DEBUGGER="opus" ;;
+    balanced)
+      MODEL_PLANNER="opus";  MODEL_REVIEWER="opus"
+      MODEL_TESTRUNNER="sonnet"; MODEL_DEBUGGER="opus" ;;
+    thrifty)
+      MODEL_PLANNER="opus";  MODEL_REVIEWER="sonnet"
+      MODEL_TESTRUNNER="sonnet"; MODEL_DEBUGGER="sonnet" ;;
+    minimal)
+      MODEL_PLANNER="sonnet"; MODEL_REVIEWER="sonnet"
+      MODEL_TESTRUNNER="sonnet"; MODEL_DEBUGGER="sonnet" ;;
+    haiku-runner|haiku_runner)
+      MODEL_PLANNER="opus";  MODEL_REVIEWER="opus"
+      MODEL_TESTRUNNER="haiku"; MODEL_DEBUGGER="opus" ;;
+    *)
+      err "Unknown preset '$1'. Valid: opus-heavy, balanced, thrifty, minimal, haiku-runner"
+      exit 1 ;;
+  esac
+}
+
+# ---------- config file ----------
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/claude-init"
+CONFIG_FILE="$CONFIG_DIR/config"
+load_config_file() {
+  [[ -f "$CONFIG_FILE" ]] || return 0
+  while IFS='=' read -r key value || [[ -n "$key" ]]; do
+    # strip whitespace and comments
+    key="${key%%#*}"; key="${key// /}"
+    value="${value%%#*}"; value="${value// /}"
+    [[ -z "$key" || -z "$value" ]] && continue
+    case "$key" in
+      planner)                       MODEL_PLANNER="$value" ;;
+      reviewer|code-reviewer)        MODEL_REVIEWER="$value" ;;
+      test-runner|test_runner|tester) MODEL_TESTRUNNER="$value" ;;
+      debugger)                      MODEL_DEBUGGER="$value" ;;
+    esac
+  done < "$CONFIG_FILE"
+}
+load_config_file
+
+# ---------- env vars (override config file) ----------
+[[ -n "${CLAUDE_INIT_PLANNER_MODEL:-}" ]]    && MODEL_PLANNER="$CLAUDE_INIT_PLANNER_MODEL"
+[[ -n "${CLAUDE_INIT_REVIEWER_MODEL:-}" ]]   && MODEL_REVIEWER="$CLAUDE_INIT_REVIEWER_MODEL"
+[[ -n "${CLAUDE_INIT_TESTRUNNER_MODEL:-}" ]] && MODEL_TESTRUNNER="$CLAUDE_INIT_TESTRUNNER_MODEL"
+[[ -n "${CLAUDE_INIT_DEBUGGER_MODEL:-}" ]]   && MODEL_DEBUGGER="$CLAUDE_INIT_DEBUGGER_MODEL"
+
+# ---------- args (highest priority) ----------
+# First pass: --preset (so individual flags can override it)
+for a in "$@"; do
+  case "$a" in
+    --preset=*) apply_preset "${a#*=}" ;;
+  esac
+done
+
+# Second pass: everything else
+for a in "$@"; do
+  case "$a" in
+    --force)        FORCE=1 ;;
+    --dry-run)      DRY_RUN=1 ;;
+    --quiet)        VERBOSE=0 ;;
+    --configure)    CONFIGURE=1 ;;
+    --show-config)  SHOW_CONFIG=1 ;;
+    --preset=*)     ;;  # handled above
+    --planner=*)        MODEL_PLANNER="${a#*=}" ;;
+    --reviewer=*)       MODEL_REVIEWER="${a#*=}" ;;
+    --code-reviewer=*)  MODEL_REVIEWER="${a#*=}" ;;
+    --test-runner=*)    MODEL_TESTRUNNER="${a#*=}" ;;
+    --testrunner=*)     MODEL_TESTRUNNER="${a#*=}" ;;
+    --debugger=*)       MODEL_DEBUGGER="${a#*=}" ;;
+    -h|--help)
+      sed -n '2,/^set -euo/p' "$0" | sed 's/^# \?//' | sed '$d'
+      exit 0
+      ;;
+    *) echo "Unknown arg: $a (try --help)" >&2; exit 1 ;;
+  esac
+done
+
+# ---------- validate resolved models ----------
+validate_model "$MODEL_PLANNER"
+validate_model "$MODEL_REVIEWER"
+validate_model "$MODEL_TESTRUNNER"
+validate_model "$MODEL_DEBUGGER"
+
+# ---------- --show-config ----------
+if [[ $SHOW_CONFIG -eq 1 ]]; then
+  echo "claude-init v$VERSION — resolved configuration"
+  echo
+  echo "Sub-agent models:"
+  echo "  planner       $MODEL_PLANNER"
+  echo "  code-reviewer $MODEL_REVIEWER"
+  echo "  test-runner   $MODEL_TESTRUNNER"
+  echo "  debugger      $MODEL_DEBUGGER"
+  echo
+  if [[ -f "$CONFIG_FILE" ]]; then
+    echo "Config file: $CONFIG_FILE (loaded)"
+  else
+    echo "Config file: $CONFIG_FILE (not present — using defaults)"
+  fi
+  exit 0
+fi
+
+# ---------- --configure ----------
+if [[ $CONFIGURE -eq 1 ]]; then
+  if [[ ! -t 0 ]]; then
+    err "--configure needs an interactive terminal (stdin is not a TTY)."
+    exit 1
+  fi
+  log ""
+  log "${B}claude-init configuration${R}"
+  log ""
+  log "This sets your global default models for sub-agents. Per-project, you"
+  log "can override these with flags like ${B}--planner=opus${R} or ${B}--preset=balanced${R}."
+  log ""
+  log "Valid choices: ${B}opus${R}, ${B}sonnet${R}, ${B}haiku${R}"
+  log ""
+
+  prompt_model() {
+    local label="$1" varname="$2" current="$3" choice
+    while true; do
+      printf "%-22s [current: %s] : " "$label" "$current" >&2
+      read -r choice
+      [[ -z "$choice" ]] && choice="$current"
+      case "$choice" in
+        opus|sonnet|haiku) eval "$varname=\"$choice\""; break ;;
+        *) printf "  ↳ '%s' is not valid. Use opus, sonnet, or haiku.\n" "$choice" >&2 ;;
+      esac
+    done
+  }
+  prompt_model "Model for planner"        MODEL_PLANNER     "$MODEL_PLANNER"
+  prompt_model "Model for code-reviewer"  MODEL_REVIEWER    "$MODEL_REVIEWER"
+  prompt_model "Model for test-runner"    MODEL_TESTRUNNER  "$MODEL_TESTRUNNER"
+  prompt_model "Model for debugger"       MODEL_DEBUGGER    "$MODEL_DEBUGGER"
+
+  mkdir -p "$CONFIG_DIR"
+  cat > "$CONFIG_FILE" <<EOF
+# claude-init global config
+# Per-project overrides: --planner=opus, --preset=balanced, etc.
+# Valid model values: opus, sonnet, haiku
+planner=$MODEL_PLANNER
+reviewer=$MODEL_REVIEWER
+test-runner=$MODEL_TESTRUNNER
+debugger=$MODEL_DEBUGGER
+EOF
+  log ""
+  log "${GR}✓${R} Saved to $CONFIG_FILE"
+  log ""
+  log "These will be used as defaults for every ${B}claude-init${R} run."
+  exit 0
+fi
+
+
+# ---------- preflight ----------
+if ! command -v claude >/dev/null 2>&1; then
+  err "claude CLI not found. Install: npm install -g @anthropic-ai/claude-code"
+  exit 1
+fi
+if ! command -v jq >/dev/null 2>&1; then
+  err "jq not found. Install: brew install jq (macOS) or apt install jq (Linux)"
+  exit 1
+fi
+if [[ ! -d .git ]]; then
+  warn "Not a git repo. Hooks and conventions assume git. Consider 'git init' first."
+fi
+
+PROJECT_NAME="$(basename "$PWD")"
+
+# ---------- stack detection ----------
+STACKS=()
+[[ -f package.json ]] && STACKS+=("Node/TypeScript")
+[[ -f pyproject.toml || -f requirements.txt || -f setup.py || -f Pipfile ]] && STACKS+=("Python")
+[[ -f Cargo.toml ]] && STACKS+=("Rust")
+[[ -f go.mod ]] && STACKS+=("Go")
+[[ -f Gemfile ]] && STACKS+=("Ruby")
+[[ -f composer.json ]] && STACKS+=("PHP")
+[[ -f pom.xml || -f build.gradle || -f build.gradle.kts ]] && STACKS+=("JVM")
+shopt -s nullglob
+TF_FILES=(*.tf)
+[[ ${#TF_FILES[@]} -gt 0 ]] && STACKS+=("Terraform")
+shopt -u nullglob
+[[ -f serverless.yml || -f serverless.yaml ]] && STACKS+=("Serverless Framework")
+[[ -f Dockerfile || -f docker-compose.yml || -f compose.yml ]] && STACKS+=("Docker")
+[[ ${#STACKS[@]} -eq 0 ]] && STACKS=("(no stack detected — fill in CLAUDE.md manually)")
+
+# ---------- command detection ----------
+BUILD_CMD=""; TEST_CMD=""; LINT_CMD=""; DEV_CMD=""
+if [[ -f package.json ]]; then
+  jq -e '.scripts.test'  package.json >/dev/null 2>&1 && TEST_CMD="npm test"
+  jq -e '.scripts.build' package.json >/dev/null 2>&1 && BUILD_CMD="npm run build"
+  jq -e '.scripts.lint'  package.json >/dev/null 2>&1 && LINT_CMD="npm run lint"
+  jq -e '.scripts.dev'   package.json >/dev/null 2>&1 && DEV_CMD="npm run dev"
+fi
+if [[ -z "$TEST_CMD" ]]; then
+  if [[ -f pyproject.toml || -f requirements.txt || -f setup.py ]]; then
+    TEST_CMD="pytest -q"
+  elif [[ -f Cargo.toml ]]; then TEST_CMD="cargo test"
+  elif [[ -f go.mod ]]; then TEST_CMD="go test ./..."
+  fi
+fi
+
+# ---------- write helpers (idempotent) ----------
+write_text() {
+  # write_text PATH BODY
+  local path="$1"; local body="$2"
+  if [[ -e "$path" ]]; then
+    # Skip silently if identical (no-op re-runs are clean)
+    if [[ "$(cat "$path" 2>/dev/null)" == "$body" ]]; then
+      keep "$path (unchanged)"; return 0
+    fi
+    if [[ $FORCE -eq 1 ]]; then
+      if [[ $DRY_RUN -eq 1 ]]; then plan_ "would back up + overwrite $path"; return 0; fi
+      cp "$path" "${path}.bak.${TIMESTAMP}"; back "${path}.bak.${TIMESTAMP}"
+    else
+      keep "$path (exists, differs; --force to overwrite)"; return 0
+    fi
+  fi
+  if [[ $DRY_RUN -eq 1 ]]; then plan_ "would create $path"; return 0; fi
+  mkdir -p "$(dirname "$path")"
+  printf "%s" "$body" > "$path"
+  make_ "$path"
+}
+write_exec() {
+  write_text "$1" "$2"
+  if [[ $DRY_RUN -eq 0 && -e "$1" ]]; then
+    chmod +x "$1"
+  fi
+  return 0
+}
+
+add_gitignore() {
+  local entries=(
+    ".claude/SKIP_TESTS"
+    ".claude/local/"
+    ".claude/settings.local.json"
+    "*.bak.[0-9]*"
+  )
+  if [[ ! -f .gitignore ]]; then
+    if [[ $DRY_RUN -eq 1 ]]; then plan_ "would create .gitignore"; return; fi
+    printf "# Claude Code\n" > .gitignore
+    make_ ".gitignore"
+  fi
+  for e in "${entries[@]}"; do
+    if ! grep -qxF "$e" .gitignore 2>/dev/null; then
+      if [[ $DRY_RUN -eq 1 ]]; then plan_ "would add '$e' to .gitignore"; continue; fi
+      printf "%s\n" "$e" >> .gitignore
+      make_ ".gitignore += $e"
+    fi
+  done
+}
+
+# ---------- begin ----------
+log ""
+log "${B}claude-init v${VERSION}${R}"
+log "${D}project:${R} ${PROJECT_NAME}"
+log "${D}stack:${R}   $(IFS=, ; echo "${STACKS[*]}")"
+[[ $DRY_RUN -eq 1 ]] && warn "DRY RUN — no files will be written"
+log ""
+
+# ---------- CLAUDE.md ----------
+STACK_LINE="$(IFS=, ; echo "${STACKS[*]}")"
+CMD_BLOCK=""
+[[ -n "$BUILD_CMD" ]] && CMD_BLOCK+="- Build: \`${BUILD_CMD}\`"$'\n'
+[[ -n "$TEST_CMD"  ]] && CMD_BLOCK+="- Test:  \`${TEST_CMD}\`"$'\n'
+[[ -n "$LINT_CMD"  ]] && CMD_BLOCK+="- Lint:  \`${LINT_CMD}\`"$'\n'
+[[ -n "$DEV_CMD"   ]] && CMD_BLOCK+="- Dev:   \`${DEV_CMD}\`"$'\n'
+[[ -z "$CMD_BLOCK" ]] && CMD_BLOCK="- TODO: document build/test/lint/dev commands here."$'\n'
+
+CLAUDE_MD="# ${PROJECT_NAME}
+
+<!-- Initialized by claude-init v${VERSION} on $(date +%Y-%m-%d) -->
+<!-- Keep under ~200 lines. Claude reads this every turn. -->
+
+## What this is
+
+TODO: 2–3 sentences. What does it do, who uses it, what's the deploy surface?
+
+## Stack
+
+${STACK_LINE}
+
+## Build & test
+
+${CMD_BLOCK}
+## Topology
+
+- \`src/\` — application code
+- \`tests/\` — test suite
+- \`.claude/\` — agent config (hooks, sub-agents, commands)
+- TODO: add the rest
+
+## Conventions
+
+- Match existing patterns. Search before inventing — Grep first.
+- New files mirror nearest-neighbor structure.
+- No new dependencies without justification.
+- Tests are required for new code paths.
+
+## Guardrails (never do these)
+
+- Never commit secrets, .env files, or credentials.
+- Never push directly to \`main\` / \`master\`. Branch + PR.
+- Never modify generated artifacts (\`dist/\`, \`build/\`, \`.next/\`, \`__pycache__/\`, \`target/\`).
+- Never disable a test to get green. Fix the cause or ask.
+- Never rewrite migrations that have run anywhere.
+
+## Sub-agents (use them)
+
+Defined in \`.claude/agents/\`:
+
+- \`planner\` ($(cap_model "$MODEL_PLANNER")) — call BEFORE coding any feature touching >2 files.
+- \`code-reviewer\` ($(cap_model "$MODEL_REVIEWER")) — call AFTER a feature, before commit. Catches subtle correctness/security issues.
+- \`test-runner\` ($(cap_model "$MODEL_TESTRUNNER")) — call instead of running tests inline; saves context.
+- \`debugger\` ($(cap_model "$MODEL_DEBUGGER")) — call when a test fails or behavior is unexpected. Root-cause analysis, not pattern-matching.
+
+## Slash commands
+
+- \`/plan <request>\` — invoke planner sub-agent
+- \`/review [target]\` — invoke code-reviewer
+- \`/ship [msg]\` — test + commit (no push)
+
+## MCP
+
+See \`.claude/MCP_SETUP.md\` for copy-paste recipes (GitHub, Postgres, Context7, Sentry, Playwright, etc.).
+
+## Failure modes (lessons learned)
+
+<!-- Add as you discover them. This is the most valuable section over time. Examples: -->
+<!-- - The \`users\` table has soft deletes (deleted_at); always filter unless told otherwise. -->
+<!-- - Integration tests need Postgres on port 5433 (\`docker-compose up -d db\`). -->
+
+TODO: Start populating after the first session. When Claude gets something wrong, document it here.
+"
+
+write_text "CLAUDE.md" "$CLAUDE_MD"
+
+# ---------- .claude/settings.json ----------
+read -r -d '' SETTINGS_JSON <<'JSON' || true
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          { "type": "command", "command": ".claude/hooks/danger-guard.sh" }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit|MultiEdit",
+        "hooks": [
+          { "type": "command", "command": ".claude/hooks/format.sh" }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "command": ".claude/hooks/test-on-stop.sh" }
+        ]
+      }
+    ]
+  }
+}
+JSON
+write_text ".claude/settings.json" "$SETTINGS_JSON"
+
+# ---------- hooks ----------
+read -r -d '' FORMAT_SH <<'BASH' || true
+#!/usr/bin/env bash
+# Polyglot post-edit formatter. Reads Claude Code hook JSON from stdin.
+# Failures never block — formatting is best-effort.
+set -uo pipefail
+
+INPUT="$(cat)"
+FILE="$(printf "%s" "$INPUT" | jq -r '.tool_input.file_path // empty' 2>/dev/null || true)"
+[[ -z "$FILE" || ! -f "$FILE" ]] && exit 0
+
+case "$FILE" in
+  *.js|*.jsx|*.ts|*.tsx|*.mjs|*.cjs|*.json|*.jsonc|*.md|*.mdx|*.yml|*.yaml|*.css|*.scss|*.html)
+    if command -v biome >/dev/null 2>&1 && [[ -f biome.json || -f biome.jsonc ]]; then
+      biome format --write "$FILE" >/dev/null 2>&1 || true
+    elif [[ -x node_modules/.bin/prettier ]]; then
+      node_modules/.bin/prettier --write --log-level silent "$FILE" >/dev/null 2>&1 || true
+    elif command -v prettier >/dev/null 2>&1; then
+      prettier --write --log-level silent "$FILE" >/dev/null 2>&1 || true
+    fi
+    ;;
+  *.py)
+    if command -v ruff >/dev/null 2>&1; then
+      ruff format "$FILE" >/dev/null 2>&1 || true
+      ruff check --fix --quiet "$FILE" >/dev/null 2>&1 || true
+    elif command -v black >/dev/null 2>&1; then
+      black --quiet "$FILE" 2>/dev/null || true
+    fi
+    ;;
+  *.go)
+    command -v gofmt   >/dev/null 2>&1 && gofmt -w "$FILE"   2>/dev/null || true
+    command -v goimports >/dev/null 2>&1 && goimports -w "$FILE" 2>/dev/null || true
+    ;;
+  *.rs)
+    command -v rustfmt >/dev/null 2>&1 && rustfmt --quiet "$FILE" 2>/dev/null || true
+    ;;
+  *.tf|*.tfvars)
+    command -v terraform >/dev/null 2>&1 && terraform fmt "$FILE" >/dev/null 2>&1 || true
+    ;;
+  *.sh|*.bash)
+    command -v shfmt >/dev/null 2>&1 && shfmt -w -i 2 "$FILE" 2>/dev/null || true
+    ;;
+  *.rb)
+    command -v rubocop >/dev/null 2>&1 && rubocop -A --force-exclusion "$FILE" >/dev/null 2>&1 || true
+    ;;
+esac
+
+exit 0
+BASH
+write_exec ".claude/hooks/format.sh" "$FORMAT_SH"
+
+read -r -d '' DANGER_SH <<'BASH' || true
+#!/usr/bin/env bash
+# Pre-Bash safety net. Returns exit 2 to BLOCK execution of dangerous commands.
+# Bypass deliberately by editing this file or running the command yourself.
+set -uo pipefail
+
+INPUT="$(cat)"
+CMD="$(printf "%s" "$INPUT" | jq -r '.tool_input.command // empty' 2>/dev/null || true)"
+[[ -z "$CMD" ]] && exit 0
+
+# Patterns of obviously-destructive commands. Tune for your environment.
+DANGER_PATTERNS=(
+  'rm[[:space:]]+-rf?[[:space:]]+/'
+  'rm[[:space:]]+-rf?[[:space:]]+~'
+  'rm[[:space:]]+-rf?[[:space:]]+\$HOME'
+  'rm[[:space:]]+-rf?[[:space:]]+\.\.?(/|$| )'
+  'mkfs\.'
+  'dd[[:space:]]+if=.*[[:space:]]+of=/dev/'
+  ':\(\)\{ :\|:& \};:'
+  'chmod[[:space:]]+-R[[:space:]]+777[[:space:]]+/'
+  'chown[[:space:]]+-R[[:space:]]+.*[[:space:]]+/'
+  '>[[:space:]]*/dev/sd[a-z]'
+  'aws[[:space:]]+s3[[:space:]]+rb[[:space:]]+.*--force'
+  'aws[[:space:]]+s3[[:space:]]+rm[[:space:]]+s3://.*--recursive'
+  'aws[[:space:]]+iam[[:space:]]+(delete-user|delete-role|delete-policy)'
+  'aws[[:space:]]+lambda[[:space:]]+delete-function'
+  'aws[[:space:]]+rds[[:space:]]+delete-db-(instance|cluster)'
+  'DROP[[:space:]]+(DATABASE|SCHEMA)'
+  'TRUNCATE[[:space:]]+TABLE'
+  'git[[:space:]]+push[[:space:]]+(-f|--force)([[:space:]]+\S+)?[[:space:]]+(main|master|production|prod)'
+  'git[[:space:]]+push[[:space:]]+\S+[[:space:]]+(main|master|production|prod)[[:space:]]+(-f|--force)'
+  'git[[:space:]]+reset[[:space:]]+--hard[[:space:]]+(origin/)?(main|master|production)'
+  'curl.+\|[[:space:]]*(sudo[[:space:]]+)?(bash|sh|zsh)'
+  'wget.+\|[[:space:]]*(sudo[[:space:]]+)?(bash|sh|zsh)'
+)
+
+for pat in "${DANGER_PATTERNS[@]}"; do
+  if printf "%s" "$CMD" | grep -qiE "$pat"; then
+    cat <<MSG >&2
+🛑 BLOCKED by .claude/hooks/danger-guard.sh
+Command: $CMD
+Pattern: $pat
+
+If you genuinely need this, run it manually outside Claude Code,
+or edit .claude/hooks/danger-guard.sh to remove the pattern.
+MSG
+    exit 2
+  fi
+done
+
+exit 0
+BASH
+write_exec ".claude/hooks/danger-guard.sh" "$DANGER_SH"
+
+read -r -d '' STOP_SH <<'BASH' || true
+#!/usr/bin/env bash
+# On Stop, run the project test suite. Exit 2 to keep Claude going if tests fail.
+# Bypass: touch .claude/SKIP_TESTS  (e.g. when explicitly debugging tests themselves).
+set -uo pipefail
+
+INPUT="$(cat)"
+ACTIVE="$(printf "%s" "$INPUT" | jq -r '.stop_hook_active // false' 2>/dev/null || echo false)"
+
+# Avoid infinite loop: if we already triggered the stop hook, let Claude finish.
+[[ "$ACTIVE" == "true" ]] && exit 0
+[[ -f .claude/SKIP_TESTS ]] && exit 0
+
+# Quick guard: if no source files changed in the last 10 min, skip tests.
+# (Saves quota when the user just chats with Claude without editing.)
+if command -v git >/dev/null 2>&1 && [[ -d .git ]]; then
+  if [[ -z "$(git status --porcelain)" ]]; then
+    exit 0
+  fi
+fi
+
+run() {
+  local label="$1"; shift
+  local out
+  if out="$("$@" 2>&1)"; then
+    return 0
+  else
+    cat <<MSG >&2
+✗ $label failed. Tests must pass before stopping.
+$out
+MSG
+    return 1
+  fi
+}
+
+if [[ -f package.json ]] && jq -e '.scripts.test' package.json >/dev/null 2>&1; then
+  run "npm test" npm test --silent || exit 2
+elif [[ -f pyproject.toml || -f pytest.ini || -f setup.cfg ]] && command -v pytest >/dev/null 2>&1; then
+  run "pytest"   pytest -q || exit 2
+elif [[ -f Cargo.toml ]]; then
+  run "cargo test" cargo test --quiet || exit 2
+elif [[ -f go.mod ]]; then
+  run "go test"   go test ./... || exit 2
+fi
+
+exit 0
+BASH
+write_exec ".claude/hooks/test-on-stop.sh" "$STOP_SH"
+
+# ---------- sub-agents ----------
+read -r -d '' AGENT_PLANNER <<'MD' || true
+---
+name: planner
+description: Use BEFORE coding any feature that touches more than 2 files, or any change with non-obvious architectural implications. Produces a written plan; never writes code.
+tools: Read, Grep, Glob, WebSearch, WebFetch
+model: __MODEL__
+---
+
+You are a senior architect. Given a feature request:
+
+1. Read the relevant existing code. Use Grep/Glob aggressively to find prior art before assuming greenfield.
+2. Identify the minimum set of files to change. Smaller diffs > larger diffs.
+3. Write a numbered plan. Each step:
+   - One file (or one focused area)
+   - One change
+   - One testable outcome
+4. Call out RISKS explicitly:
+   - Data migrations or schema changes
+   - Breaking API or contract changes
+   - Test coverage gaps
+   - Security implications (auth, input validation, secrets)
+   - Performance implications (N+1, large allocations)
+5. List OPEN QUESTIONS the human should answer before execution.
+6. STOP. Do not write code. Do not edit files. The main agent executes the plan.
+
+Plans should fit on one screen (≤ 15 numbered steps). Larger features → break into phases.
+Output format: a markdown doc with sections "Plan", "Risks", "Open Questions".
+MD
+write_text ".claude/agents/planner.md" "${AGENT_PLANNER//__MODEL__/$MODEL_PLANNER}"
+
+read -r -d '' AGENT_REVIEWER <<'MD' || true
+---
+name: code-reviewer
+description: Use AFTER a feature is implemented and BEFORE commit, or to review a specific commit/branch/file. Read-only — reports issues, never edits.
+tools: Read, Grep, Glob, Bash
+model: __MODEL__
+---
+
+You are a senior code reviewer. Determine scope from the request (default: uncommitted changes via `git diff` and `git status`). Review for:
+
+1. **Correctness** — logic errors, off-by-one, null handling, race conditions, error paths.
+2. **Security** — injection, secrets in code, unsafe deserialization, missing authn/authz, SSRF, path traversal.
+3. **Conventions** — does it match existing patterns? Use Grep to verify before flagging deviations.
+4. **Tests** — are new code paths covered? Are existing tests still meaningful?
+5. **Performance** — obvious O(n²), N+1 queries, unbounded allocations, blocking I/O on hot paths.
+6. **API/contract stability** — breaking changes flagged loudly.
+
+Output format:
+- **BLOCKING** (must fix before merge): bullets, each with `path:line` and a one-line rationale.
+- **SUGGESTIONS** (nice to have): bullets, same format.
+- **LGTM** if nothing material.
+
+Read-only. Do not propose code edits inline; describe the issue. The main agent decides what to do.
+MD
+write_text ".claude/agents/code-reviewer.md" "${AGENT_REVIEWER//__MODEL__/$MODEL_REVIEWER}"
+
+read -r -d '' AGENT_TESTRUNNER <<'MD' || true
+---
+name: test-runner
+description: Use to run tests without bloating the main context. Returns failure summaries only — fast, focused, reliable parsing of real test output.
+tools: Bash, Read, Grep
+model: __MODEL__
+---
+
+You are a focused test runner. Your job:
+
+1. Detect the test framework (package.json scripts, pytest, cargo test, go test, etc.).
+2. Run the full suite OR a scoped subset if requested ("just the auth tests", "only TestFoo").
+3. Return a tight summary:
+   - PASS count / FAIL count / SKIP count
+   - For each failure: `path:line — test name — one-line assertion error`
+   - First-suspect file/function based on stack trace
+
+If everything passes: return one line — `✓ N passed.`
+
+DO NOT:
+- Propose fixes
+- Modify any files
+- Explain what tests are or how they work
+- Re-run flaky tests more than once
+
+You exist to keep the main agent's context clean. Return less, not more.
+MD
+write_text ".claude/agents/test-runner.md" "${AGENT_TESTRUNNER//__MODEL__/$MODEL_TESTRUNNER}"
+
+read -r -d '' AGENT_DEBUGGER <<'MD' || true
+---
+name: debugger
+description: Use when a test is failing, an error is occurring, or behavior is unexpected. Reproduces, isolates, applies a minimal fix, verifies.
+tools: Read, Grep, Glob, Bash, Edit
+model: __MODEL__
+---
+
+You are a debugging specialist. Given a bug report or failing test:
+
+1. **Reproduce.** Run the failing case yourself. Capture exact error + stack.
+2. **Isolate.** Bisect by reading the trace, hypothesizing the bug location, and verifying with prints/logs/Read. Do not fix until you have a confirmed hypothesis.
+3. **Diagnose.** State root cause in one sentence: "X happens because Y."
+4. **Fix.** Smallest possible change that resolves the bug. No incidental refactors.
+5. **Test.** Add a regression test if one doesn't already exist. Then rerun the failing case + adjacent tests.
+6. **Report.** Brief writeup: what was broken, why, what changed, what's now covered by tests.
+
+Rules:
+- One bug, one fix. If you find a second bug while debugging, note it; don't fix it in this session.
+- If reproduction fails (intermittent / environmental), say so and stop. Don't speculate-fix.
+- If the fix would touch >3 files, escalate back to the main agent — that's planner territory.
+MD
+write_text ".claude/agents/debugger.md" "${AGENT_DEBUGGER//__MODEL__/$MODEL_DEBUGGER}"
+
+# ---------- slash commands ----------
+read -r -d '' CMD_PLAN <<'MD' || true
+---
+description: Invoke the planner sub-agent on a feature request, then ask for approval before executing.
+---
+
+Invoke the `planner` sub-agent for this request:
+
+$ARGUMENTS
+
+Show the plan verbatim. Then ask: "Approve this plan? (yes / changes / cancel)" — wait for the user's response before doing any work.
+MD
+write_text ".claude/commands/plan.md" "$CMD_PLAN"
+
+read -r -d '' CMD_REVIEW <<'MD' || true
+---
+description: Run the code-reviewer sub-agent against the current uncommitted changes (or a specified target).
+---
+
+Invoke the `code-reviewer` sub-agent. Target: $ARGUMENTS (default: uncommitted changes from `git diff` and `git status`). Return the review verbatim.
+MD
+write_text ".claude/commands/review.md" "$CMD_REVIEW"
+
+read -r -d '' CMD_SHIP <<'MD' || true
+---
+description: Run tests via test-runner, then commit (no push) if green.
+---
+
+1. Invoke the `test-runner` sub-agent. If it returns any failures, STOP and report them — do not commit.
+2. Run any project linters (npm run lint, ruff check, cargo clippy, etc.) if present. Surface errors.
+3. If everything is green:
+   - `git status` to confirm scope
+   - `git add -A`
+   - `git commit -m "<message>"` — message comes from $ARGUMENTS, or generate a Conventional Commits message summarizing the diff if $ARGUMENTS is empty
+4. Do NOT push. Show the commit hash and summary; let the human push.
+MD
+write_text ".claude/commands/ship.md" "$CMD_SHIP"
+
+# ---------- MCP setup reference ----------
+read -r -d '' MCP_SETUP <<'MD' || true
+# MCP Setup — Comprehensive Reference
+
+Curated MCP servers for Claude Code, organized by purpose. Every entry includes
+install command, when to reach for it, and gotchas. Pick what serves your
+project, not what's trending.
+
+---
+
+## Quick concepts
+
+**Scope** — three places to register a server:
+
+| Scope     | Stored in                          | Visible to                       | When to use                                |
+|-----------|------------------------------------|----------------------------------|--------------------------------------------|
+| `user`    | `~/.claude.json`                   | every project on your machine    | personal credentials, cross-repo tools     |
+| `project` | `.mcp.json` (committed to repo)    | every contributor on the project | shared dev tools (DB schemas, Playwright)  |
+| `local`   | `.claude/settings.local.json`      | only this machine, this project  | one-off experiments, ignored by git        |
+
+**Transports** — three ways a server runs:
+
+- `stdio` — local subprocess (most common; npx/uvx commands).
+- `sse` / `streamable-http` — remote HTTP server with OAuth or bearer token.
+- Pick HTTP for vendor-hosted servers (GitHub, Sentry, Linear). Pick stdio when
+  the server needs local credentials or filesystem access.
+
+**Tool Search** — Claude Code lazy-loads MCP tools by default (saves ~95% of
+context). You can run 10+ servers without drowning the prompt. Override with
+`alwaysLoad: true` in the server config for tools you call constantly.
+
+**Verify** — after any install:
+
+```bash
+claude mcp list                 # see registered servers
+claude mcp get <name>           # inspect / debug one
+claude mcp remove <name>        # clean up failed attempts
+```
+
+---
+
+## How to choose
+
+Three to seven servers is the sweet spot. Each adds tool descriptions to
+Claude's context budget — even with Tool Search, more servers means slower
+tool selection. Audit yearly: a server you don't use is a server slowing you
+down.
+
+Decision rules:
+
+1. **Does Claude Code already do this?** Filesystem and basic memory are
+   built-in. Skip the dedicated MCP versions unless you need cross-repo file
+   access or shared memory across agents.
+2. **Vendor-maintained > community.** Roughly 66% of audited community MCP
+   servers had security findings in early 2026. Default to official servers
+   from the actual vendor (GitHub by GitHub, Sentry by Sentry, Stripe by
+   Stripe).
+3. **Read-only by default.** Use a read-only DB role, a read-only GitHub
+   token, a read-only AWS role. Promote to write access only when you need it.
+4. **Pin versions.** Once a server works, pin it in `.mcp.json`. Don't
+   auto-update on every spawn — the ecosystem is young and breaking changes
+   happen.
+
+---
+
+## 1. Core (start here)
+
+### GitHub — official, hosted, OAuth
+The single highest-impact install for most repos. PR review, issue triage,
+branch operations.
+
+```bash
+claude mcp add --transport http --scope user github https://api.githubcopilot.com/mcp/ \
+  --header "Authorization: Bearer $GITHUB_PAT"
+```
+
+Scope your token: read-only for review workflows, push access only when Claude
+should actually open PRs. Use a fine-grained PAT, not classic.
+
+### Context7 — live, version-pinned library docs
+Kills hallucinated APIs on fast-moving frameworks (Next.js, LangChain,
+Drizzle, anything that changes more than once a quarter). Claude pulls the
+real signature for the version you're on, not a stale 2024 example.
+
+```bash
+claude mcp add --scope user context7 "npx -y @upstash/context7-mcp"
+```
+
+Reach for it whenever Claude says "here's how that library works" and you're
+not 100% sure it's right.
+
+### Git (built-in repo operations)
+Most Claude Code installs already shell out to git via Bash. The dedicated
+server is only worth it if you want structured commit/diff/log objects rather
+than parsed text output.
+
+```bash
+claude mcp add --scope user git "uvx mcp-server-git"
+```
+
+Most users skip this — Bash with git is simpler.
+
+---
+
+## 2. Databases & Data Stores
+
+### Postgres / Redshift (Postgres wire protocol works for Redshift)
+```bash
+claude mcp add --scope project postgres "npx -y @modelcontextprotocol/server-postgres" \
+  --env "POSTGRES_CONNECTION_STRING=postgres://USER:PASS@HOST:5432/DB"
+```
+
+**Always** point at a read-only role for anything resembling production.
+Claude *will* propose UPDATEs and DELETEs if it thinks they're warranted.
+
+### MySQL / MariaDB
+```bash
+claude mcp add --scope project mysql "npx -y @benborla29/mcp-server-mysql" \
+  --env "MYSQL_HOST=..." --env "MYSQL_USER=..." --env "MYSQL_PASS=..."
+```
+
+### SQLite
+```bash
+claude mcp add --scope project sqlite "uvx mcp-server-sqlite --db-path ./db.sqlite"
+```
+
+### MongoDB
+```bash
+claude mcp add --scope project mongo "npx -y mongodb-mcp-server" \
+  --env "MDB_MCP_CONNECTION_STRING=mongodb+srv://..."
+```
+
+### Redis / Valkey
+```bash
+claude mcp add --scope project redis "npx -y @modelcontextprotocol/server-redis" \
+  --env "REDIS_URL=redis://localhost:6379"
+```
+
+### Snowflake
+```bash
+claude mcp add --scope project snowflake "uvx mcp-server-snowflake" \
+  --env "SNOWFLAKE_ACCOUNT=..." --env "SNOWFLAKE_USER=..." --env "SNOWFLAKE_PASSWORD=..."
+```
+
+### BigQuery
+```bash
+claude mcp add --scope project bigquery "uvx mcp-server-bigquery" \
+  --env "GOOGLE_APPLICATION_CREDENTIALS=/path/to/sa.json"
+```
+
+### DynamoDB
+Use the AWS MCP (below) — it covers DynamoDB plus the rest of AWS.
+
+---
+
+## 3. Cloud & Infrastructure
+
+### AWS — official Amazon MCP
+Lambda, Redshift, S3, IAM, CloudWatch, DynamoDB, etc. Single server, broad
+coverage. Authenticates via your local AWS profile.
+
+```bash
+claude mcp add --scope user aws "uvx awslabs.aws-api-mcp-server@latest" \
+  --env "AWS_PROFILE=default" --env "AWS_REGION=us-east-1"
+```
+
+For production: use named profiles with read-only IAM roles. Promote to
+write-capable profiles only for the session that needs them.
+
+### Cloudflare — official
+Workers, R2, KV, D1, DNS, deployment.
+
+```bash
+claude mcp add --transport http --scope user cloudflare https://mcp.cloudflare.com/sse
+```
+
+### Vercel — official
+Project status, deployment logs, env vars, preview URLs.
+
+```bash
+claude mcp add --transport http --scope user vercel https://mcp.vercel.com/sse
+```
+
+### Supabase
+Database, auth, storage, edge functions in one server.
+
+```bash
+claude mcp add --scope project supabase "npx -y @supabase/mcp-server-supabase" \
+  --env "SUPABASE_URL=..." --env "SUPABASE_SERVICE_ROLE_KEY=..."
+```
+
+### Firebase
+```bash
+claude mcp add --scope project firebase "npx -y @gannonh/firebase-mcp" \
+  --env "GOOGLE_APPLICATION_CREDENTIALS=/path/to/sa.json"
+```
+
+### Docker / Docker Hub
+Container ops, image search, registry interactions.
+
+```bash
+claude mcp add --scope user docker "uvx docker-mcp"
+```
+
+### Kubernetes
+```bash
+claude mcp add --scope user k8s "npx -y mcp-server-kubernetes"
+```
+
+Read-only by default; pass `--enable-write` only when you actively need
+`kubectl apply`.
+
+### Terraform
+```bash
+claude mcp add --scope project terraform "uvx terraform-mcp-server"
+```
+
+---
+
+## 4. Browser, Web, & Scraping
+
+### Playwright — official Microsoft
+Browser automation, UI verification, E2E test debugging, screenshot/PDF
+generation. Best-in-class for any UI-touching work.
+
+```bash
+claude mcp add --scope project playwright "npx -y @playwright/mcp@latest"
+```
+
+### Puppeteer
+Older sibling. Use Playwright unless you specifically need Chrome DevTools
+Protocol features Playwright doesn't expose.
+
+```bash
+claude mcp add --scope project puppeteer "npx -y @modelcontextprotocol/server-puppeteer"
+```
+
+### Fetch — built-in style web fetching
+Pull and convert web pages to markdown. Useful for "summarize this URL" tasks.
+
+```bash
+claude mcp add --scope user fetch "uvx mcp-server-fetch"
+```
+
+Pin to a specific commit/tag — this server has security implications since it
+can hit any URL.
+
+### Firecrawl
+Production-grade web scraping with JS rendering, structured extraction.
+
+```bash
+claude mcp add --scope user firecrawl "npx -y @firecrawl/mcp-server" \
+  --env "FIRECRAWL_API_KEY=fc-..."
+```
+
+### Brave Search / Tavily / Perplexity
+Web search inside agent loops. Pick one — they're functionally similar.
+
+```bash
+# Brave (free tier, 2k queries/mo)
+claude mcp add --scope user brave "npx -y @modelcontextprotocol/server-brave-search" \
+  --env "BRAVE_API_KEY=..."
+
+# Tavily (developer-friendly, free tier)
+claude mcp add --scope user tavily "npx -y tavily-mcp" --env "TAVILY_API_KEY=tvly-..."
+
+# Perplexity (paid, higher-quality summaries)
+claude mcp add --scope user perplexity "npx -y server-perplexity-ask" \
+  --env "PERPLEXITY_API_KEY=pplx-..."
+```
+
+---
+
+## 5. Observability & Monitoring
+
+### Sentry — official, OAuth
+Alert → fix loops without context-switching. Claude reads the error,
+identifies the file, drafts the fix.
+
+```bash
+claude mcp add --transport http --scope user sentry https://mcp.sentry.dev/mcp
+```
+
+### Datadog
+```bash
+claude mcp add --scope user datadog "uvx mcp-server-datadog" \
+  --env "DD_API_KEY=..." --env "DD_APP_KEY=..."
+```
+
+### Grafana
+```bash
+claude mcp add --scope project grafana "npx -y @grafana/mcp-grafana" \
+  --env "GRAFANA_URL=..." --env "GRAFANA_API_KEY=..."
+```
+
+### CloudWatch
+Covered by the AWS server. Don't install separately.
+
+### Honeycomb
+```bash
+claude mcp add --scope project honeycomb "npx -y @honeycombio/honeycomb-mcp" \
+  --env "HONEYCOMB_API_KEY=..."
+```
+
+---
+
+## 6. Communication & Project Management
+
+### Slack
+Search messages, post updates, summarize channels. OAuth flow on first run.
+
+```bash
+claude mcp add --transport http --scope user slack https://mcp.slack.com/mcp
+```
+
+### Linear — official
+Issue tracking, sprint management, comment threads.
+
+```bash
+claude mcp add --transport http --scope user linear https://mcp.linear.app/sse
+```
+
+### Jira / Atlassian
+```bash
+claude mcp add --transport http --scope user atlassian https://mcp.atlassian.com/v1/sse
+```
+
+### Notion — official
+```bash
+claude mcp add --transport http --scope user notion https://mcp.notion.com/mcp
+```
+
+### Asana — official
+```bash
+claude mcp add --transport http --scope user asana https://mcp.asana.com/sse
+```
+
+### Discord
+```bash
+claude mcp add --scope user discord "npx -y @v-3/discordmcp" \
+  --env "DISCORD_TOKEN=..."
+```
+
+### Gmail / Google Calendar / Drive — Google Workspace
+```bash
+claude mcp add --transport http --scope user gmail https://gmailmcp.googleapis.com/mcp/v1
+claude mcp add --transport http --scope user gcal https://calendarmcp.googleapis.com/mcp/v1
+claude mcp add --transport http --scope user gdrive https://drivemcp.googleapis.com/mcp/v1
+```
+
+---
+
+## 7. Commerce & Payments
+
+### Stripe — official
+Search customers, query subscriptions, draft refunds, query payment intents.
+
+```bash
+claude mcp add --scope user stripe "npx -y @stripe/mcp" \
+  --env "STRIPE_SECRET_KEY=sk_test_..."  # use restricted key, not live root
+```
+
+Use a *restricted* API key for read-only investigations. Live root keys in an
+agent loop are how accidents happen.
+
+### Shopify Admin — official
+Products, orders, customers, metafields, analytics.
+
+```bash
+claude mcp add --scope user shopify "npx -y @shopify/admin-mcp"
+```
+
+### PayPal
+```bash
+claude mcp add --scope user paypal "npx -y @paypal/mcp-server" \
+  --env "PAYPAL_CLIENT_ID=..." --env "PAYPAL_CLIENT_SECRET=..."
+```
+
+### Square
+```bash
+claude mcp add --scope user square "npx -y @square/mcp-server" \
+  --env "SQUARE_ACCESS_TOKEN=..."
+```
+
+---
+
+## 8. Marketing & Analytics
+
+### Klaviyo
+Email/SMS automation, segments, flow performance. Useful for e-commerce.
+
+```bash
+claude mcp add --scope user klaviyo "npx -y @klaviyo/mcp-server" \
+  --env "KLAVIYO_API_KEY=pk_..."
+```
+
+### Google Ads — official
+```bash
+claude mcp add --transport http --scope user gads https://mcp.google.com/ads/sse
+```
+
+### Meta Ads (Facebook + Instagram) — official
+```bash
+claude mcp add --transport http --scope user meta https://mcp.meta.com/ads/sse
+```
+
+### HubSpot
+```bash
+claude mcp add --transport http --scope user hubspot https://mcp.hubspot.com/sse
+```
+
+### Salesforce
+```bash
+claude mcp add --transport http --scope user salesforce https://mcp.salesforce.com/sse
+```
+
+### Posthog
+```bash
+claude mcp add --scope user posthog "npx -y @posthog/mcp" \
+  --env "POSTHOG_API_KEY=..." --env "POSTHOG_HOST=https://app.posthog.com"
+```
+
+### Plausible / Fathom / Simple Analytics
+Most expose REST APIs cleanly enough that Claude can hit them via Bash + curl
+without a dedicated MCP server.
+
+---
+
+## 9. AI / ML / Search
+
+### HuggingFace Hub
+Model search, dataset browsing, Spaces interactions.
+
+```bash
+claude mcp add --scope user huggingface "npx -y @huggingface/mcp-server" \
+  --env "HF_TOKEN=hf_..."
+```
+
+### Vectara
+Managed RAG / vector search for production semantic search.
+
+```bash
+claude mcp add --scope project vectara "npx -y @vectara/mcp-server" \
+  --env "VECTARA_API_KEY=..." --env "VECTARA_CORPUS_ID=..."
+```
+
+### Pinecone
+```bash
+claude mcp add --scope project pinecone "npx -y @pinecone/mcp-server" \
+  --env "PINECONE_API_KEY=..."
+```
+
+### Qdrant
+```bash
+claude mcp add --scope project qdrant "uvx mcp-server-qdrant" \
+  --env "QDRANT_URL=..." --env "QDRANT_API_KEY=..."
+```
+
+### Sequential Thinking — reference server
+Forces a structured reasoning loop. Useful for complex multi-step problems
+where you want Claude to externalize each step.
+
+```bash
+claude mcp add --scope user thinking "npx -y @modelcontextprotocol/server-sequential-thinking"
+```
+
+---
+
+## 10. Specialty / Niche
+
+### Filesystem (use with caution)
+Only install if you need Claude to access files *outside* your project root.
+Inside the project, Claude Code's built-in Read/Write/Edit tools are
+sufficient and safer.
+
+```bash
+claude mcp add --scope user fs "npx -y @modelcontextprotocol/server-filesystem /Users/you/scratch /Users/you/Documents"
+```
+
+Always scope to specific directories. Never pass `/` as a path.
+
+### Memory (knowledge graph)
+Persistent knowledge graph across sessions. Skip unless you're building
+something cross-agent — Claude Code's CLAUDE.md and auto-memory cover most
+single-developer workflows.
+
+```bash
+claude mcp add --scope user memory "npx -y @modelcontextprotocol/server-memory"
+```
+
+### Time
+Timezone math, scheduling. Trivial; skip unless you've actually had Claude get
+timezone arithmetic wrong.
+
+```bash
+claude mcp add --scope user time "uvx mcp-server-time"
+```
+
+### Apple Notes / Reminders (macOS)
+Personal task wrangling, not for production code.
+
+```bash
+claude mcp add --scope user apple "npx -y @apple/mcp-server"
+```
+
+### Zapier
+Bridge to ~7,000 apps via Zapier's natural-language action layer. Useful when
+no native MCP exists and the alternative is writing your own wrapper.
+
+```bash
+claude mcp add --transport http --scope user zapier https://mcp.zapier.com/api/mcp/mcp
+```
+
+### n8n
+Self-hosted alternative to Zapier with MCP support.
+
+```bash
+claude mcp add --scope user n8n "npx -y @n8n-io/n8n-mcp-server" \
+  --env "N8N_API_KEY=..." --env "N8N_HOST=..."
+```
+
+---
+
+## Project-tier picks (by stack)
+
+Edit this section to match what you actually use. Everything else can be
+deleted to keep the file lean.
+
+### Web SaaS (Node + Postgres)
+GitHub · Postgres · Sentry · Playwright · Context7
+
+### E-commerce (Shopify + AWS)
+GitHub · Shopify · AWS · Stripe · Klaviyo · Postgres (read-only on Redshift)
+
+### Mobile + Backend
+GitHub · Supabase or Firebase · Sentry · Linear · Context7
+
+### Data / ML
+GitHub · Postgres · Snowflake or BigQuery · HuggingFace · Sequential Thinking
+
+### Infrastructure / DevOps
+GitHub · AWS or Cloudflare · Kubernetes · Datadog · Terraform
+
+---
+
+## Discipline — read before installing more than 5 servers
+
+- **Each server adds tool descriptions.** Even with Tool Search, more servers
+  means slower tool selection. 30+ servers will visibly slow Claude Code's
+  first response on every prompt.
+- **Memory cost is real.** Each stdio server runs as a subprocess (~20–100MB).
+  Ten servers = up to 1 GB of background processes when Claude Code is open.
+- **Audit credentials quarterly.** A token you forgot you granted is a token
+  you can't reason about. `claude mcp list` then prune.
+- **Never commit `.mcp.json` with secrets.** Use `--env` references that
+  read from your shell environment, and add `.claude/settings.local.json` to
+  `.gitignore` (the init script does this already).
+- **Watch for prompt injection.** Servers that ingest untrusted content
+  (Fetch, browser tools, email readers, ticket trackers with public submission)
+  can carry instructions an attacker wants Claude to execute. Treat their
+  output as data, not commands.
+
+---
+
+## Debugging cheat sheet
+
+```bash
+claude mcp list                         # what's registered
+claude mcp get <name>                   # full config + last error
+claude mcp remove <name>                # clean up
+claude mcp test <name>                  # verify a single server (v2.1+)
+
+# Server hangs on first run? Run it manually to see auth prompts:
+npx -y @scope/name                      # for stdio servers
+
+# Server returns nothing? Check tool budget — Tool Search may have hidden it.
+# Set alwaysLoad: true in the server config, or call /mcp from inside Claude
+# Code to see what's loaded.
+
+# Tool name collision? Two servers exporting `read_issue` etc.
+# Use the tools field in `.mcp.json` to rename or filter.
+```
+
+If a server's tools should *always* be visible to Claude (no Tool Search
+indirection), edit `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "github": {
+      "type": "http",
+      "url": "https://api.githubcopilot.com/mcp/",
+      "alwaysLoad": true
+    }
+  }
+}
+```
+
+---
+
+## Discovery
+
+When you need a server not listed here:
+
+- **Official registry:** https://github.com/modelcontextprotocol/servers
+- **Anthropic-curated:** https://www.claudemcp.com/
+- **Community lists:** `tolkonepiu/best-of-mcp-servers` (weekly-updated
+  ranked list), `punkpeye/awesome-mcp-servers`, `mcp-awesome.com`,
+  `popularaitools.ai`
+- **Build your own:** the MCP TypeScript or Python SDK takes about an hour to
+  go from zero to working server. Often the right answer when you have
+  project-specific tools (run-smoke-test, get-feature-flag, query-our-warehouse).
+MD
+write_text ".claude/MCP_SETUP.md" "$MCP_SETUP"
+
+# ---------- gitignore ----------
+add_gitignore
+
+# ---------- summary ----------
+log ""
+log "${GR}${B}Done.${R}"
+log ""
+log "Sub-agent models applied:"
+log "  ${D}planner       →${R} $(cap_model "$MODEL_PLANNER")"
+log "  ${D}code-reviewer →${R} $(cap_model "$MODEL_REVIEWER")"
+log "  ${D}test-runner   →${R} $(cap_model "$MODEL_TESTRUNNER")"
+log "  ${D}debugger      →${R} $(cap_model "$MODEL_DEBUGGER")"
+log ""
+log "Next steps:"
+log "  ${D}1.${R}  Open ${B}CLAUDE.md${R} and replace the TODO sections (especially 'What this is' and 'Topology')."
+log "  ${D}2.${R}  ${B}cd${R} into the project and run ${B}claude${R}. Try ${B}/plan${R}, ${B}/review${R}, ${B}/ship${R}."
+log "  ${D}3.${R}  Skim ${B}.claude/MCP_SETUP.md${R} and install the 2-3 MCP servers you'll actually use."
+log "  ${D}4.${R}  When Claude makes a mistake, document it in CLAUDE.md's 'Failure modes' section."
+log "  ${D}5.${R}  Re-run ${B}claude-init${R} anytime — idempotent. Use ${B}--force${R} to refresh hook scripts."
+log ""
+log "Hook bypass switches:"
+log "  ${D}-${R}  ${B}touch .claude/SKIP_TESTS${R}  → skips Stop-hook tests (e.g. when debugging tests themselves)"
+log "  ${D}-${R}  Edit ${B}.claude/hooks/danger-guard.sh${R} to remove patterns you find too aggressive"
+log ""
