@@ -42,10 +42,6 @@ die()  { printf "${RD}✗${R}  %s\n" "$*" >&2; exit 1; }
 command -v curl >/dev/null 2>&1 || die "curl is required."
 command -v bash >/dev/null 2>&1 || die "bash is required."
 
-if [[ "$REPO" == *"HankH18"* ]]; then
-  die "This installer still has the placeholder repo name. Edit install.sh and replace HankH18 with your GitHub username, or set CLAUDE_INIT_REPO=owner/repo when running."
-fi
-
 # ---------- download ----------
 say ""
 say "${B}claude-init installer${R}"
