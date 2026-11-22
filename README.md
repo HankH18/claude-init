@@ -1,3 +1,5 @@
+> **Superseded by [agent-init](https://github.com/HankH18/agent-init)**, which covers Claude Code and Codex CLI and adds sync, doctor and migrate. Existing claude-init projects: run `agent-init migrate`.
+
 # claude-init
 
 > Opinionated, idempotent project scaffolding for [Claude Code](https://code.claude.com/). One command, full setup: project memory, hooks, sub-agents, slash commands, and an MCP reference doc — with configurable model assignments per sub-agent.
@@ -9,8 +11,6 @@
 ```bash
 curl -fsSL https://raw.githubusercontent.com/HankH18/claude-init/main/install.sh | bash
 ```
-
-> Replace `HankH18` with the GitHub user or org that hosts this repo. If you forked it, that's you.
 
 The installer drops the `claude-init` binary into `~/.local/bin/`. If that's not on your `PATH`, the installer tells you exactly what to add to your shell rc.
 
